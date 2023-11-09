@@ -1,0 +1,449 @@
+---
+title: "Differential Gene Expression Practice"
+output:
+  pdf_document: default
+  html_document: default
+date: "2023-10-27"
+---
+
+###
+### ACESO Genomics and TIDREC collaboration on the SCOPE project
+
+###
+## Author: Pavol Genzor
+
+###
+
+## Setup your environment
+
+
+```{r clean, eval=TRUE}
+## clean
+ls()
+rm(list = ls())
+gc()
+
+## directories
+getwd()
+setwd("/Users/a_PGenzor/Documents/GITHUB/ahjf_scope")
+FIG.DIR <- "/Users/a_PGenzor/Documents/GITHUB/ahjf_scope/results/figures/"
+TAB.TIR <- "/Users/a_PGenzor/Documents/GITHUB/ahjf_scope/results/tables/"
+SES.DIR <- "/Users/a_PGenzor/Documents/GITHUB/ahjf_scope/sessions/"
+
+## versioning and seed
+version.date <- "26OCT23"
+aSeed = 2610
+set.seed(aSeed)
+
+## libraries
+library(data.table)
+library(ggplot2)
+library(scales)
+library(ggrepel)
+library(ggplot2)
+library(ggpubr)
+
+```
+
+## Load the data
+
+
+```{r load data, eval=TRUE}
+## metadata address
+meta_path <- "/Users/a_PGenzor/Documents/GITHUB/ahjf_scope/data/batch1/aceso_scope_batch1_data/A_Encoded/batch1_metadata.csv"
+meta_path
+
+## load into data table
+#?fread
+
+meta.dt <- fread(input = meta_path)
+str(meta.dt)
+
+##
+## Load raw count data
+##
+
+rc_path <- "/Users/a_PGenzor/Documents/GITHUB/ahjf_scope/data/batch1/aceso_scope_batch1_data/A_Encoded/gene_count_matrix.csv"
+rc.dt <- fread(rc_path)
+rc.dt[,1:5]
+str(rc.dt)
+
+## zoom in at small piece
+rc.dt[,1:4]
+```
+
+## Filter raw data
+
+
+```{r filter rc}
+## input data
+rc.dt[,1:5]
+
+## summarize raw data
+#?.SD
+
+rc.ss.dt <- rc.dt[,.(rowsum=sum(.SD),
+                     rowmax=max(.SD),
+                     rowmin=min(.SD)),
+                  by=gene_id]
+rc.ss.dt
+
+## filter the table
+rc.ss.dt[rowsum > 0] ## always required
+rc.ss.dt[rowsum > 50] ## always DESIRED
+
+## extract gene ids that are expressed 
+usefull_gid <- rc.ss.dt[rowsum > 50][rowmax > 50][["gene_id"]]
+usefull_gid[1:10]
+
+##
+## Remove not useful genes
+##
+
+c(rc.dt[["gene_id"]] %in% usefull_gid)[1:10]
+rc.filt.dt <- rc.dt[gene_id %in% usefull_gid]
+rc.filt.dt[,1:5]
+```
+
+## Group comparison
+
+
+```{r t0 vs t28}
+## Input data
+rc.filt.dt
+
+## Melt
+rc.filt.dtm <- melt.data.table(data = rc.filt.dt,
+                               id.vars = "gene_id", 
+                               variable.name = "sample",
+                               value.name = "raw_count")
+rc.filt.dtm
+
+## extract the time variable from name
+##?tstrsplit
+
+lapply(tstrsplit(rc.filt.dtm[["sample"]], split="_"),head)
+str(tstrsplit("My_name_is_Pavol", split="_", keep = 3))
+str(unlist(tstrsplit("My_name_is_Pavol", split="_", keep = 3)))
+
+rc.filt.dtm[,"time" := tstrsplit(sample, split="_", keep = 2)]
+rc.filt.dtm
+
+## Lets compare gene expression by group
+mc.dtm <- rc.filt.dtm[,.(mean_rc=mean(raw_count),
+                         sd_rc=sd(raw_count),
+                         N=length(raw_count)), 
+                      by=list(gene_id,time)]
+mc.dtm
+
+## How do you search for patterns/geen names
+## search for a particular gene to check
+##?grep
+
+grep("IL10",mc.dtm[["gene_id"]]) # location of IL10 term - index
+mc.dtm[grep("IL10",gene_id)] # table subset to show IL10 containing terms
+mc.dtm[grep("IL10$",gene_id)] # table showing only "IL10" word itself
+mc.dtm[grep("CXCL10",gene_id)] # another example
+
+#
+# Calculate the degree of change - fold change
+#
+
+mc.dtm
+mc.dtw <- dcast.data.table(data = mc.dtm,
+                           formula = gene_id~time, 
+                           value.var = "mean_rc")
+
+## calculate the fold change
+## log transformation simplifies plotting
+
+log2(10/5)
+log2(5/10)
+log2(0) # <- zeros are possible and therefore need to be accounted for
+
+min(mc.dtw[["t0"]]) # can't divide by zero
+min(mc.dtw[["t28"]]) #  can't divide by zero
+
+## calculate L2FC with constant to avoid zeros
+mc.dtw[,"log2FoldChange" := log2(t28+1) - log2(t0+1)]
+mc.dtw
+
+## sanity check - data should be normally distributed
+hist(mc.dtw[["log2FoldChange"]], breaks = 100)
+hist(mc.dtw[["log2FoldChange"]], breaks = 100, xlim = c(-3,3))
+log2(1.1534050)
+
+## order your data for simpler reading
+mc.dtw <- mc.dtw[order(log2FoldChange)]
+mc.dtw[1:50]
+
+##
+## Calculate the p.value
+##
+
+## extract names of genes you want to test
+gid_list <- mc.dtw[["gene_id"]]
+str(gid_list)
+
+## use the sample specific table to have all the observations
+rc.filt.dtm
+
+## Run Students t-test
+##?t.test
+
+## example calculation
+a_gene <- "ENSG00000124208.16|PEDS1-UBE2V1"
+t.test(x = rc.filt.dtm[gene_id %in% a_gene][time %in% "t28"][["raw_count"]],
+       y = rc.filt.dtm[gene_id %in% a_gene][time %in% "t0"][["raw_count"]])
+
+## to extract p-value
+t.test(x = rc.filt.dtm[gene_id %in% a_gene][time %in% "t28"][["raw_count"]],
+       y = rc.filt.dtm[gene_id %in% a_gene][time %in% "t0"][["raw_count"]])$p.value
+
+
+## Run a loop through all gene names to calculate the p.values
+## -> results in new table and takes a little time
+
+pval.dt <- rbindlist(lapply(X = gid_list, function(g){
+  # make gene sub table
+  sub.dt <- rc.filt.dtm[gene_id %in% g]
+  # calculate p.value
+  pval <- t.test(x = sub.dt[time %in% "t28"][["raw_count"]],
+                 y = sub.dt[time %in% "t0"][["raw_count"]])$p.value
+  # make new table
+  res.dt <- data.table("gene_id"=g,
+                       "p.value"=pval)
+  # return the last created variable
+  return(res.dt)}))
+
+## adjust p.value to account for false positives 
+##?p.adjust
+
+pval.dt[,"p.adjust" := p.adjust(p = p.value,method = "BH")]
+pval.dt
+
+##
+## Combine two tables
+##
+
+## tables to combine
+mc.dtw
+pval.dt
+
+## add p.val table to mean count table
+res.dt <- mc.dtw[pval.dt,on=.(gene_id=gene_id)]
+res.dt
+
+## add count table to p.val table
+## both ways work as long as there "on" columns are properly defined
+pval.dt[mc.dtw,on=.(gene_id=gene_id)]
+
+```
+
+## Plot the results
+
+
+```{r volcano}
+## Input data
+res.dt
+
+## Sort your data: p.adjust
+res.dt[order(p.adjust)]
+res.dt[order(-p.adjust)]
+
+## Sort your data: p.value
+res.dt[order(p.value)]
+
+## How many genes have significant p.value
+res.dt[p.value <= 0.05]
+
+##
+## GGPLOT - most versatile R plotting package
+## -> please refer to many online manuals
+## ?geom_point
+
+## examine table
+res.dt[abs(log2FoldChange) > 4] # There are a lot of low values - background
+res.dt[,"baseMean" := (t0+t28)/2] # baseMean helps filtering these
+res.dt[abs(log2FoldChange) > 4]
+res.dt
+
+## remove lowly expressed genes <- at least one sample has to have 50 reads
+res.dt <- res.dt[baseMean > 50]
+res.dt
+
+## significantly UP
+res.up.dt <- res.dt[p.value <= 0.05][log2FoldChange > 0][order(-log2FoldChange)][1:10]
+res.dn.dt <- res.dt[p.value <= 0.05][log2FoldChange < 0][order(log2FoldChange)][1:10]
+
+## view genes on extremes of x axis to set reasonable axis size
+res.dt[abs(log2FoldChange)>4]
+res.dt[p.value < 0.001]
+
+## plot
+ggp.volcano <- ggplot() + theme_pubclean() +
+  geom_point(data = res.dt, 
+             aes(x = log2FoldChange, y = -log10(p.value)),
+             size=1, colour = "grey30") +
+  geom_point(data = res.dt[p.value <= 0.05][log2FoldChange > 0], 
+             aes(x = log2FoldChange, y = -log10(p.value)),
+             size=1, colour = "firebrick1") +
+  geom_point(data = res.dt[p.value <= 0.05][log2FoldChange < 0], 
+             aes(x = log2FoldChange, y = -log10(p.value)),
+             size=1, colour = "dodgerblue") +
+  geom_text_repel(data = res.up.dt, 
+             aes(x = log2FoldChange, y = -log10(p.value), 
+                 label = unlist(tstrsplit(gene_id,split="\\|",keep = 2))),
+             size=3, colour = "firebrick1", 
+             nudge_x = 3, 
+             direction = "y",
+             force = 2,
+             force_pull = NA,
+             vjust=1,
+             hjust=1,
+             segment.size = 0.2) +
+  geom_text_repel(data = res.dn.dt, 
+             aes(x = log2FoldChange, y = -log10(p.value), 
+                 label = unlist(tstrsplit(gene_id,split="\\|",keep = 2))),
+             size=3, colour = "dodgerblue", 
+             nudge_x = -2, 
+             force = 3,
+             force_pull = NA,
+             vjust=0,
+             direction = "y",
+             segment.size = 0.2) +
+  scale_x_continuous(limits = c(-7,7), breaks = seq(-10,10,2)) +
+  xlab("Log2 Fold Change (day28/day0)") +
+  theme(aspect.ratio = 1,
+        panel.grid.major.y = element_blank()); ggp.volcano
+
+## save to file
+ggsave(filename = paste(FIG.DIR,"scope_batch1_volcano_time_",
+                        version.date,".pdf"), 
+       plot = ggp.volcano, width = 6, height = 8)
+```
+
+## Runnging DGE using DE
+Ideally, with raw counts you would use the below package to get the results and normalized data. Once you have the normalize data you can do any plotting with it that you require. Normalization of raw counts and modeling are really the strength of this package. 
+
+```{r deseq, eval=FALSE}
+##
+## RUN ENTIRE ANALYSIS WITH THE PACKAEGE
+##
+
+
+## library
+library(DESeq2)
+
+## raw count data as matrix
+rc.mat <- as.matrix(x = rc.dt, rownames = "gene_id")
+rc.mat[1:5,1:5]
+
+## sample information
+si.dt <- data.table("sample"=colnames(rc.dt)[-1])
+si.dt[,"time" := tstrsplit(sample,split="_",keep = 2)]
+si.dt
+
+## create dds object
+dds <- DESeqDataSetFromMatrix(countData = rc.mat, 
+                              colData = si.dt, 
+                              design = ~time)
+
+## run DESeq2
+dds <- DESeq(object = dds)
+
+## results
+resultsNames(dds)
+summary(results(dds, contrast = c("time","t28","t0")))
+
+##
+## Extract various objects
+##
+
+aRes.dt <- as.data.table(results(object = dds, contrast = c("time","t28","t0")), keep.rownames=TRUE)
+colnames(aRes.dt) <- gsub("rn","gene_id",colnames(aRes.dt))
+aRes.dt <- aRes.dt[order(pvalue)]
+
+## variance stabilization
+vst <- vst(dds)
+
+## normalized counts
+nc.dt <- as.data.table(counts(object = dds, normalized = TRUE), keep.rownames = TRUE)
+colnames(nc.dt) <- gsub("rn","gene_id",colnames(nc.dt))
+
+##
+## View results and objects
+##
+
+class(res) # it is a "smart object"
+summary(res)
+
+
+##
+## Plot Volcano
+##
+
+aRes.dt
+
+## Filter
+aRes.dt <- aRes.dt[!is.na(pvalue)][baseMean > 0]
+aRes.dt <- aRes.dt[baseMean>50]
+
+## significantly UP
+aRes.up.dt <- aRes.dt[pvalue <= 0.05][log2FoldChange > 0][order(-log2FoldChange)][1:10]
+aRes.dn.dt <- aRes.dt[pvalue <= 0.05][log2FoldChange < 0][order(log2FoldChange)][1:10]
+
+## view genes on extremes of x axis to set reasonable axis size
+aRes.dt[abs(log2FoldChange)>4]
+aRes.dt[p.value < 0.001]
+
+## plot
+deseq.volcano <- ggplot() + theme_pubclean() +
+  geom_point(data = aRes.dt, 
+             aes(x = log2FoldChange, y = -log10(pvalue)),
+             size=1, colour = "grey30") +
+  geom_point(data = aRes.dt[pvalue <= 0.05][log2FoldChange > 0], 
+             aes(x = log2FoldChange, y = -log10(pvalue)),
+             size=1, colour = "firebrick1") +
+  geom_point(data = aRes.dt[pvalue <= 0.05][log2FoldChange < 0], 
+             aes(x = log2FoldChange, y = -log10(pvalue)),
+             size=1, colour = "dodgerblue") +
+  geom_text_repel(data = aRes.up.dt, 
+             aes(x = log2FoldChange, y = -log10(pvalue), 
+                 label = unlist(tstrsplit(gene_id,split="\\|",keep = 2))),
+             size=3, colour = "firebrick1", 
+             nudge_x = 3, 
+             direction = "y",
+             force = 2,
+             force_pull = NA,
+             vjust=1,
+             hjust=1,
+             segment.size = 0.2) +
+  geom_text_repel(data = aRes.dn.dt, 
+             aes(x = log2FoldChange, y = -log10(pvalue), 
+                 label = unlist(tstrsplit(gene_id,split="\\|",keep = 2))),
+             size=3, colour = "dodgerblue", 
+             nudge_x = -2, 
+             force = 3,
+             force_pull = NA,
+             vjust=0,
+             direction = "y",
+             segment.size = 0.2) +
+  #scale_x_continuous(limits = c(-7,7), breaks = seq(-10,10,2)) +
+  xlab("Log2 Fold Change (day28/day0)") +
+  theme(aspect.ratio = 1,
+        panel.grid.major.y = element_blank()); deseq.volcano
+
+## save to file
+ggsave(filename = paste(FIG.DIR,"scope_batch1_volcano_time_deseq_",
+                        version.date,".pdf"), 
+       plot = deseq.volcano, width = 6, height = 8)
+
+
+```
+
+
+
+
+
+
