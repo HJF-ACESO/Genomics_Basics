@@ -323,8 +323,18 @@ ggsave(filename = paste(FIG.DIR,"scope_batch1_volcano_time_",
        plot = ggp.volcano, width = 6, height = 8)
 ```
 
+##
+##
+##
+##
+
 ## Runnging DGE using DE
 Ideally, with raw counts you would use the below package to get the results and normalized data. Once you have the normalize data you can do any plotting with it that you require. Normalization of raw counts and modeling are really the strength of this package. 
+
+##
+##
+##
+##
 
 ```{r deseq, eval=FALSE}
 ##
