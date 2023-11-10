@@ -1,6 +1,6 @@
-### Genomics_Basics
+# Genomics_Basics
 
-# Author: Pavol Genzor
+### Author: Pavol Genzor
 Description of basic workflow for RNA-Seq analysis
 
 
