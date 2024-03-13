@@ -1,0 +1,267 @@
+---
+title: "Using DESeq2 for differential gene expression analysis\n Part 1"
+output:
+  pdf_document: default
+  html_document: default
+date: "2024-03-13"
+---
+
+
+###
+### ACESO Genomics and TIDREC collaboration on the SCOPE project
+
+Goal:
+   - use the DESeq2 analysis to identify specific enriched or depleted genes
+   - perform gene set enrichment analysis to find relevant pathways 
+
+## 1. Setup your environment
+
+```{r setup environment}
+## Clean
+rm(list = ls())
+gc()
+
+##
+## PACKAGES
+##
+
+## load basic packages
+suppressPackageStartupMessages(suppressWarnings({
+  library(data.table);library(parallel);library(tidyr);library(tidyverse)}))
+
+
+## For plotting
+suppressPackageStartupMessages(suppressWarnings({
+  library(ggpubr);library(ggbeeswarm);library(RColorBrewer);library(ggdendro);
+  library(ggridges);library(ggrepel)}))
+
+
+## For clustering
+suppressPackageStartupMessages(suppressWarnings({library(pheatmap)}))
+
+## For DESeq analysis
+suppressPackageStartupMessages(suppressWarnings({library(DESeq2)}))
+#library(sva) <- could be used for batch normalization
+
+## For GSEA
+suppressPackageStartupMessages(suppressWarnings({
+  library(clusterProfiler);library(msigdb);library(msigdbr);
+  library(enrichplot);library(ggupset)}))
+
+##
+## DIRECTORIES
+##
+
+TAB.DIR <- "/Users/a_PGenzor/Documents/GITHUB/ahjf_scope/results/tables/"
+FIG.DIR <- "/Users/a_PGenzor/Documents/GITHUB/ahjf_scope/results/figures/"
+#SES.DIR <- "/Users/a_PGenzor/Documents/GITHUB/ahjf_scope/sessions/"
+
+##
+## VERSION AND CONTROLS
+##
+
+aSeed="1003"
+set.seed(aSeed)
+version.date = "10MAR24"
+
+```
+
+## 2. Load the data
+
+ - Loading count data should be relatively simple since it should all be contained in the single matrix.
+ - Make sure that the column names in count matrix match the names in your metadata tables or that there is a way to calcualte them
+
+
+```{r Load}
+##
+## gene count table
+count_table_path <- "/Users/a_PGenzor/Documents/GITHUB/ahjf_scope/data/from_kimkee/10MAR24/RNASeq_COVID/gene_count_matrix.csv"
+cnt.dt <- fread(count_table_path)
+cnt.dt[1:5,1:3]
+
+## splitting complex names into pieces
+colnames(cnt.dt)[1:5]
+unlist(tstrsplit(colnames(cnt.dt),split="_",keep = 1))
+unlist(tstrsplit(colnames(cnt.dt),split="_",keep = 2))
+
+## make new colnames
+cnt_new_col_names <- paste(unlist(tstrsplit(colnames(cnt.dt),split="_",keep = 2)),
+      unlist(tstrsplit(colnames(cnt.dt),split="_",keep = 1)), 
+      sep = "_")
+cnt_new_col_names <-gsub("id_gene","gene_id",cnt_new_col_names)
+colnames(cnt.dt) <- cnt_new_col_names
+cnt.dt[1:5,1:5] ## <- ready to use
+
+##
+## metadata
+metadata_path <- "/Users/a_PGenzor/Documents/GITHUB/ahjf_scope/data/from_kimkee/10MAR24/RNASeq_COVID/Metadata_RNAseq_PG_10MAR24.csv"
+meta.dt <- fread(metadata_path)
+
+meta_cols_to_use <- c("IGU_Code","sex","pathogen","disease","time")
+meta.clean.dt <- meta.dt[,.SD,.SDcols = meta_cols_to_use]
+meta.clean.dt[,"subject":=tstrsplit(IGU_Code,split="_",keep = 1)]
+meta.clean.dt[,"seq_id":= paste(time,subject,sep = "_")]
+meta.clean.dt
+
+```
+
+## 3. Format the data 
+
+Once the data is loaded in a clean way, make sure that you format the data types to ones that can be used by DESeq - eg. matrix instead of table and so on
+  - This is a good place to filter your data to remove uninformative genes
+  - Here you will also be combining the sample information with the metadata so that they correspond to each other during analysis
+    - NOTE: metadata and data alignment is a key for analysis. 
+
+```{r Filter, make sample information table, and Format}
+##
+## Filter raw counts
+##
+
+cnt.dt[1:5,1:5]
+
+## summarize raw counts
+cnt.dt.sumarized <- cnt.dt[,list(max=max(.SD), 
+                                 min=min(.SD),
+                                 mean=mean(unlist(.SD))), by=gene_id]
+cnt.dt.sumarized
+
+## get gene names that have sufficient expression
+## NOTE: this parameter is subjective and you can/should play with your cutoff value
+## NOTE: sometimes, it makes more sense to not use min if you think some genes are on/off in subjects
+## NOTE: counts are not like TPM, 10 counts per gene may still mean gene is off
+
+cnt.dt.sumarized[mean > 0]
+cnt.dt.sumarized[mean > 10]
+cnt.dt.sumarized[mean > 50] 
+
+gene_ids_to_include <- cnt.dt.sumarized[mean > 50][["gene_id"]]
+
+## filter data
+cnt.filtered.dt <- cnt.dt[gene_id %in% gene_ids_to_include]
+cnt.filtered.dt[1:5,1:5]
+
+## 
+## Make sample information table
+##
+
+## create a sample information table from cnt table
+## NOTE: this will make sure you will always have the right samples present
+si.dt <- data.table("seq_id"=colnames(cnt.dt)[-1])
+si.dt[,"subject":=tstrsplit(seq_id,split="_",keep = 2)]
+si.dt[,"time":=tstrsplit(seq_id,split="_",keep = 1)]
+si.dt
+
+##
+## Load metadata and add to the sample information
+##
+
+# peak at ready metadata
+meta.clean.dt
+
+# add to si.dt to make a master table (mt)
+si.dt 
+si.mt.dt <- meta.clean.dt[si.dt,on=.(seq_id=seq_id,time=time,subject=subject)]
+si.mt.dt[1:5,]
+
+## filter table to keep only comparison samples
+si.mt.comp.dt <- si.mt.dt[time %in% c("D0","D28")]
+si.mt.comp.dt[,.N,by=list(disease, time)]
+si.mt.comp.dt[,.N,by=time]
+
+##
+## Filter count table to keep comparison columns
+##
+
+# present columns and their format
+colnames(cnt.filtered.dt) 
+
+# wanted columns and their format matching
+si.mt.comp.dt[1:5,]
+wanted_comp_columns <- si.mt.comp.dt[["seq_id"]]
+wanted_comp_columns
+
+## filter raw counts to keep the same samples
+cnt.filtered.comp.dt <- cnt.filtered.dt[,.SD,.SDcols = c("gene_id",wanted_comp_columns)]
+cnt.filtered.comp.dt[1:5,1:5]
+
+##
+## Format into right types
+##date
+
+## counts need to be a matrix where rownames are gene_id
+cnt.comp.mat <- as.matrix(x = cnt.filtered.comp.dt, rownames = "gene_id")
+
+## sample information can remain a data table
+si.mt.comp.dt[1:5,]
+
+```
+
+## 4. Run DESeq2 analysis
+
+- Once the data has been prepared, the DESeq package can be employed and comparative analysis performed. The analysis consists of three simple steps:
+  1. Create a DESeq object using the raw counts and metadata from previous section. And specifying the comparison MODEL. 
+  2. Running the DESeq command.
+  3. Retrieval of the result tables for plotting and analysis. 
+
+
+```{r DESeq2 }
+##
+## Create a DESeq object
+##
+
+## Data
+#cnt.comp.mat[1:5,1:5]
+#si.mt.comp.dt[1:5]
+
+## load data into deseq object
+dds <- DESeqDataSetFromMatrix(countData = cnt.comp.mat, 
+                              colData = si.mt.comp.dt, 
+                              design = ~time)
+
+## add condition to the modeling
+dds.sex <- DESeqDataSetFromMatrix(countData = cnt.comp.mat, 
+                              colData = si.mt.comp.dt, 
+                              design = ~time+sex)
+
+##
+## Run DESeq Analysis
+##
+
+## two modes - with and without sex consideration
+dds <- DESeq(dds)
+dds.sex <- DESeq(dds.sex)
+
+##
+## View and retrieve the results
+##
+
+## Look at results without sex consideration
+resultsNames(dds)
+res <- results(object = dds, name = "time_D28_vs_D0", alpha = 0.05)
+summary(res)
+
+## Look at the results with sex consideration
+resultsNames(dds.sex)
+res.sex <- results(object = dds.sex, name = "time_D28_vs_D0", alpha = 0.05)
+summary(res.sex)
+
+## export a table of results for each
+res.dt <- as.data.table(results(object = dds, name = "time_D28_vs_D0", alpha = 0.05), keep.rownames=TRUE)
+colnames(res.dt) <- gsub("rn","gene_id",colnames(res.dt))
+
+res.sex.dt <- as.data.table(results(object = dds.sex, name = "time_D28_vs_D0", alpha = 0.05), keep.rownames=TRUE)
+colnames(res.sex.dt) <- gsub("rn","gene_id",colnames(res.sex.dt))
+
+## RESULT TABLES
+res.dt <- res.dt[order(padj,log2FoldChange)]
+res.dt
+
+res.sex.dt <- res.sex.dt[order(padj,log2FoldChange)]
+res.sex.dt
+```
+
+5. DESeq result plots
+
+6. GSEA analysis 
+
+7. GSEA plots
