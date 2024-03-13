@@ -10,8 +10,8 @@ Description of basic workflow for RNA-Seq analysis. The tools include practice w
 
 Current markdowns include:
 1. Simple DGE analysis using TPM output of Stringtie
-  - Includes volcano plot preparation
+      - Includes volcano plot preparation
 
-2. DGE using DESeq2 and raw count data from Stringtie analysis
+3. DGE using DESeq2 and raw count data from Stringtie analysis
 
 
