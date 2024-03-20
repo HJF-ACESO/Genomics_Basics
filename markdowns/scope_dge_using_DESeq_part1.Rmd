@@ -262,6 +262,13 @@ res.sex.dt
 
 5. DESeq result plots
 
+```{r}
+
+```
+
+
+
+
 6. GSEA analysis 
 
 7. GSEA plots
