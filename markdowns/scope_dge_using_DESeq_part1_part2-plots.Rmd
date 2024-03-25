@@ -1,0 +1,732 @@
+---
+title: "Differential Gene Exprpression and Pathway Analysis"
+output:
+  pdf_document: default
+  html_document: default
+date: "2024-03-25"
+---
+  
+
+## BACKGROUND
+ACESO Genomics and TIDREC collaboration on the SCOPE project. The example code below is meant to illustrate the process of standard gene expresison and pathway analysis to the enable RNA-Seq analytical capabilities going forward.
+
+
+## CONTENT:
+ - PART1 - Loading data, preparation and running of DESeq2 analysis
+ - PART2 - Plotting data and Gene Set Enrichment Analysis
+ - PART3 - Exploring results plots
+ - PART4 - Table1 and metadata summaries
+
+##
+## PART1
+##
+
+Goal:
+   - use the DESeq2 analysis to identify specific enriched or depleted genes
+   - perform gene set enrichment analysis to find relevant pathways 
+
+## 1. Setup your environment
+
+```{r setup environment}
+## Clean
+rm(list = ls())
+gc()
+
+##
+## PACKAGES
+##
+
+## load basic packages
+suppressPackageStartupMessages(suppressWarnings({
+  library(data.table);library(parallel);library(tidyr);library(tidyverse)}))
+
+
+## For plotting
+suppressPackageStartupMessages(suppressWarnings({
+  library(ggpubr);library(ggbeeswarm);library(RColorBrewer);library(ggdendro);
+  library(ggridges);library(ggrepel)}))
+
+
+## For clustering
+suppressPackageStartupMessages(suppressWarnings({library(pheatmap)}))
+
+## For DESeq analysis
+suppressPackageStartupMessages(suppressWarnings({library(DESeq2)}))
+#library(sva) <- could be used for batch normalization
+
+## For GSEA
+suppressPackageStartupMessages(suppressWarnings({
+  library(clusterProfiler);library(msigdb);library(msigdbr);
+  library(enrichplot);library(ggupset)}))
+
+##
+## DIRECTORIES
+##
+
+TAB.DIR <- "/Users/a_PGenzor/Documents/GITHUB/ahjf_scope/results/tables/"
+FIG.DIR <- "/Users/a_PGenzor/Documents/GITHUB/ahjf_scope/results/figures/"
+#SES.DIR <- "/Users/a_PGenzor/Documents/GITHUB/ahjf_scope/sessions/"
+
+##
+## VERSION AND CONTROLS
+##
+
+aSeed="1003"
+set.seed(aSeed)
+version.date = "10MAR24"
+
+```
+
+## 2. Load the data
+
+ - Loading count data should be relatively simple since it should all be contained in the single matrix.
+ - Make sure that the column names in count matrix match the names in your metadata tables or that there is a way to calcualte them
+
+
+```{r Load}
+##
+## gene count table
+count_table_path <- "/Users/a_PGenzor/Documents/GITHUB/ahjf_scope/data/from_kimkee/10MAR24/RNASeq_COVID/gene_count_matrix.csv"
+cnt.dt <- fread(count_table_path)
+cnt.dt[1:5,1:3]
+
+## splitting complex names into pieces
+colnames(cnt.dt)[1:5]
+unlist(tstrsplit(colnames(cnt.dt),split="_",keep = 1))
+unlist(tstrsplit(colnames(cnt.dt),split="_",keep = 2))
+
+## make new colnames
+cnt_new_col_names <- paste(unlist(tstrsplit(colnames(cnt.dt),split="_",keep = 2)),
+      unlist(tstrsplit(colnames(cnt.dt),split="_",keep = 1)), 
+      sep = "_")
+cnt_new_col_names <-gsub("id_gene","gene_id",cnt_new_col_names)
+colnames(cnt.dt) <- cnt_new_col_names
+cnt.dt[1:5,1:5] ## <- ready to use
+
+##
+## metadata
+metadata_path <- "/Users/a_PGenzor/Documents/GITHUB/ahjf_scope/data/from_kimkee/10MAR24/RNASeq_COVID/Metadata_RNAseq_PG_10MAR24.csv"
+meta.dt <- fread(metadata_path)
+
+meta_cols_to_use <- c("IGU_Code","sex","pathogen","disease","time")
+meta.clean.dt <- meta.dt[,.SD,.SDcols = meta_cols_to_use]
+meta.clean.dt[,"subject":=tstrsplit(IGU_Code,split="_",keep = 1)]
+meta.clean.dt[,"seq_id":= paste(time,subject,sep = "_")]
+meta.clean.dt
+
+```
+
+## 3. Format the data 
+
+Once the data is loaded in a clean way, make sure that you format the data types to ones that can be used by DESeq - eg. matrix instead of table and so on
+  - This is a good place to filter your data to remove uninformative genes
+  - Here you will also be combining the sample information with the metadata so that they correspond to each other during analysis
+    - NOTE: metadata and data alignment is a key for analysis. 
+
+```{r Filter, make sample information table, and Format, cache=TRUE}
+##
+## Filter raw counts
+##
+
+cnt.dt[1:5,1:5]
+
+## summarize raw counts
+cnt.dt.sumarized <- cnt.dt[,list(max=max(.SD), 
+                                 min=min(.SD),
+                                 mean=mean(unlist(.SD))), by=gene_id]
+cnt.dt.sumarized
+
+## get gene names that have sufficient expression
+## NOTE: this parameter is subjective and you can/should play with your cutoff value
+## NOTE: sometimes, it makes more sense to not use min if you think some genes are on/off in subjects
+## NOTE: counts are not like TPM, 10 counts per gene may still mean gene is off
+
+cnt.dt.sumarized[mean > 0]
+cnt.dt.sumarized[mean > 10]
+cnt.dt.sumarized[mean > 50] 
+
+gene_ids_to_include <- cnt.dt.sumarized[mean > 50][["gene_id"]]
+
+## filter data
+cnt.filtered.dt <- cnt.dt[gene_id %in% gene_ids_to_include]
+cnt.filtered.dt[1:5,1:5]
+
+## 
+## Make sample information table
+##
+
+## create a sample information table from cnt table
+## NOTE: this will make sure you will always have the right samples present
+si.dt <- data.table("seq_id"=colnames(cnt.dt)[-1])
+si.dt[,"subject":=tstrsplit(seq_id,split="_",keep = 2)]
+si.dt[,"time":=tstrsplit(seq_id,split="_",keep = 1)]
+si.dt
+
+##
+## Load metadata and add to the sample information
+##
+
+# peak at ready metadata
+meta.clean.dt
+
+# add to si.dt to make a master table (mt)
+si.dt 
+si.mt.dt <- meta.clean.dt[si.dt,on=.(seq_id=seq_id,time=time,subject=subject)]
+si.mt.dt[1:5,]
+
+## filter table to keep only comparison samples
+si.mt.comp.dt <- si.mt.dt[time %in% c("D0","D28")]
+si.mt.comp.dt[,.N,by=list(disease, time)]
+si.mt.comp.dt[,.N,by=time]
+
+##
+## Filter count table to keep comparison columns
+##
+
+# present columns and their format
+colnames(cnt.filtered.dt) 
+
+# wanted columns and their format matching
+si.mt.comp.dt[1:5,]
+wanted_comp_columns <- si.mt.comp.dt[["seq_id"]]
+wanted_comp_columns
+
+## filter raw counts to keep the same samples
+cnt.filtered.comp.dt <- cnt.filtered.dt[,.SD,.SDcols = c("gene_id",wanted_comp_columns)]
+cnt.filtered.comp.dt[1:5,1:5]
+
+##
+## Format into right types
+##date
+
+## counts need to be a matrix where rownames are gene_id
+cnt.comp.mat <- as.matrix(x = cnt.filtered.comp.dt, rownames = "gene_id")
+
+## sample information can remain a data table
+si.mt.comp.dt[1:5,]
+
+```
+
+## 4. Run DESeq2 analysis
+
+ - Once the data has been prepared, the DESeq package can be employed and comparative analysis performed. The analysis consists of three simple steps:
+    1. Create a DESeq object using the raw counts and metadata from previous section. And specifying the comparison MODEL. 
+    2. Running the DESeq command.
+    3. Retrieval of the result tables for plotting and analysis. 
+
+
+```{r DESeq2, cache=TRUE}
+##
+## Create a DESeq object
+##
+
+## Data
+#cnt.comp.mat[1:5,1:5]
+#si.mt.comp.dt[1:5]
+
+## load data into deseq object
+dds <- DESeqDataSetFromMatrix(countData = cnt.comp.mat, 
+                              colData = si.mt.comp.dt, 
+                              design = ~time)
+
+## add condition to the modeling
+dds.sex <- DESeqDataSetFromMatrix(countData = cnt.comp.mat, 
+                              colData = si.mt.comp.dt, 
+                              design = ~time+sex)
+
+##
+## Run DESeq Analysis
+##
+
+## two modes - with and without sex consideration
+dds <- DESeq(dds)
+dds.sex <- DESeq(dds.sex)
+
+##
+## View and retrieve the results
+##
+
+## Look at results without sex consideration
+resultsNames(dds)
+res <- results(object = dds, name = "time_D28_vs_D0", alpha = 0.05)
+summary(res)
+
+## Look at the results with sex consideration
+resultsNames(dds.sex)
+res.sex <- results(object = dds.sex, name = "time_D28_vs_D0", alpha = 0.05)
+summary(res.sex)
+
+## export a table of results for each
+res.dt <- as.data.table(results(object = dds, name = "time_D28_vs_D0", alpha = 0.05), keep.rownames=TRUE)
+colnames(res.dt) <- gsub("rn","gene_id",colnames(res.dt))
+
+res.sex.dt <- as.data.table(results(object = dds.sex, name = "time_D28_vs_D0", alpha = 0.05), keep.rownames=TRUE)
+colnames(res.sex.dt) <- gsub("rn","gene_id",colnames(res.sex.dt))
+
+## RESULT TABLES
+res.dt <- res.dt[order(padj,log2FoldChange)]
+res.dt
+
+res.sex.dt <- res.sex.dt[order(padj,log2FoldChange)]
+res.sex.dt
+```
+
+
+##
+## PART2
+## 
+
+Goal: 
+  - Explore ways of plotting results from DESeq2 analysis
+  - Use the results in Gene Set Enrichemnt Analysis
+
+
+## 1. Plot PCA of the results
+
+  - PCA plot is one of the typical plots to evaluate whether there are any patterns in your data
+  - First, the data is normalized 
+
+##
+```{r PCA plot, fig.align='left', fig.width=7, fig.height=9}
+# Input data
+#dds.sex
+#si.mt.comp.dt
+
+## Stabilize the data using variance stabilizing transformation
+vsd.sex <- vst(object = dds.sex)
+vsd.sex
+
+## Use native DESeq PCA plotting capabilities
+#?plotPCA
+plotPCA(object = vsd.sex, intgroup = c("time","sex"))
+
+## Modify the plot by saving into object and adjusting the ggplot parameters within it
+## -> https://coolors.co/
+## -> above is a great website for color choosing
+
+## number of colors should match the number of conditions
+four_colors <- c("#8ecae6","#ffb703","#219ebc","#fb8500")
+
+## Use the ggplot capabilities to make nicer custom plot
+pca.plot <- plotPCA(object = vsd.sex, intgroup = c("time","sex"))
+pca.plot + theme_pubclean() + 
+  geom_point(size = 2) +
+  ggtitle(paste0("PCA using sex-adjusted DESeq2 results\n",
+                 "NOTE: there is a sex difference")) +
+  scale_colour_manual(values = four_colors) +
+  theme(aspect.ratio = 1, 
+        legend.position = "bottom")
+
+##
+## PCA on dds (no sex adjustment)
+## -> The PCA looks the same, however, the resulting genes are different due to different model [~time+sex]
+
+## Stabilize the data
+#vsd <- vst(object = dds)
+
+## Plot similar plot using custom ggplot 
+#pca.plot <- plotPCA(object = vsd, intgroup = c("time","sex"))
+#pca.plot + theme_pubclean() + 
+#  geom_point(size = 2) +
+#  ggtitle(paste0("PCA using NOT-adjusted for sex DESeq2 results\n",
+#                 "NOTE: there is a sex difference")) +
+#  scale_colour_manual(values = four_colors) +
+#  theme(aspect.ratio = 1, 
+#        legend.position = "right")
+
+```
+
+## 2. Plot Boxplot of the normalized counts
+
+  - It can be an important control or piece of data to look at the distribution of expression of a particular gene in your data
+  - To do so we extract the normalized counts (or use TPM data) and use boxplot that summarized number of imporatant statistics including median, quantiles and outliers
+  
+##
+```{r Boxplot, fig.align='left', fig.width=7, fig.height=9}
+## Input
+#dds.sex
+#si.mt.comp.dt
+
+## Extract normalized count data
+# ?counts <- function that extracts normalized data from dds object
+ncount.dt <- as.data.table(counts(dds.sex, normalized=TRUE), keep.rownames = TRUE)
+colnames(ncount.dt) <- gsub("rn","gene_id",colnames(ncount.dt))
+ncount.dt[1:5,1:5]
+
+## Re-arrange the table and get gene names
+ncount.dtm <- melt.data.table(data = ncount.dt, id.vars = "gene_id", 
+                              variable.name = "subject",
+                              value.name = "ncount")
+ncount.dtm[,"gene_name" := tstrsplit(gene_id,split="\\|",keep = 2)]
+ncount.dtm
+
+## Combine the normalized counts with metadata
+ncount.dtm <- ncount.dtm[si.mt.comp.dt,on=.(subject=seq_id)]
+ncount.dtm[1:5]
+
+## select genes of interest
+goi <- c("IFI27","CCL2","CD177","XIST","CXCL10")
+
+## subset the count table
+ncount.goi.dtm <- ncount.dtm[gene_name %in% goi]
+ncount.goi.dtm
+
+## Boxplot with all the points
+ggplot() + theme_pubclean() +
+  # plots all the points
+  geom_quasirandom(data = ncount.goi.dtm,
+                   aes(x = gene_name, y = ncount, 
+                       fill = sex, colour = time),
+                   dodge.width = 0.8, size = 1) +
+  geom_boxplot(data = ncount.goi.dtm, 
+               aes(x = gene_name, y = ncount, 
+                   fill = sex, colour = time),
+               alpha = 0.5, outlier.shape = NA) +
+  ggtitle(paste0("Boxplot with ggbeeswarm plot showing distribution of the counts\n",
+                 "Data split by sex and timepoint; NOTE - there are few MALEs with high XIST expression")) +
+  scale_colour_brewer(palette = "Dark2") +
+  scale_fill_brewer(palette = "Dark2") +
+  # use wrap to conviniently re-arrange results
+  facet_wrap(~sex) +
+  scale_y_log10() +
+  theme(aspect.ratio = 1.5,
+        axis.text = element_text(colour = "black"),
+        legend.position = "bottom")
+
+## NOTE: PRACTICE - Try identifying and plotting sex-specific 
+##      genes that could help distinguish genetic sex
+
+
+
+```
+
+## 3. Volcano plot
+
+  - Volcanos are a common way to show overall change in gene expression in comparison of two conditions
+  - They combine statistical information with directional expression change information 
+  - It is also nice to highlight few genes of interest on these plots
+
+##
+```{r Volcano plot of the results, fig.align='left', fig.width=7, fig.height=9}
+## Input data
+#res.sex.dt
+
+## Sig. up and down
+## NOTE: ideally by padj value and can also be done by pvalue
+res.up.dt <- res.sex.dt[padj <= 0.05][log2FoldChange > 0][order(-log2FoldChange)][1:10]
+res.dn.dt <- res.sex.dt[padj <= 0.05][log2FoldChange < 0][order(log2FoldChange)][1:10]
+
+## Volcano
+ggplot() + theme_pubclean() +
+  # plot non-significant points
+  geom_point(data = res.sex.dt[pvalue > 0.05], ## non-significant genes - all
+             aes(x = log2FoldChange, y = -log10(pvalue)),
+             size=1, colour = "black") +
+  
+  # plot points by significant pvalue
+  geom_point(data = res.sex.dt[pvalue <= 0.05], 
+             aes(x = log2FoldChange, y = -log10(pvalue)),
+             size=1, colour = "grey50") +
+  
+  # plot only top significant - INCREASED
+  geom_point(data = res.sex.dt[padj <= 0.05][log2FoldChange > 0], 
+             aes(x = log2FoldChange, y = -log10(pvalue)),
+             size=1, colour = "firebrick1") +
+  
+  # add labels
+  geom_text_repel(data = res.up.dt, 
+             aes(x = log2FoldChange, y = -log10(pvalue), 
+                 label = unlist(tstrsplit(gene_id,split="\\|",keep = 2))),
+             size=3, colour = "firebrick1", segment.linetype = "dotted",
+             nudge_x = 1, 
+             direction = "y",
+             force = 2,
+             force_pull = NA,
+             vjust=1,
+             hjust=1,
+             segment.size = 0.2) +
+  
+  # plot only top signficant - DECREASED
+  geom_point(data = res.sex.dt[padj <= 0.05][log2FoldChange < 0], 
+             aes(x = log2FoldChange, y = -log10(pvalue)),
+             size=1, colour = "dodgerblue") +
+  
+  # add labels
+  geom_text_repel(data = res.dn.dt, 
+             aes(x = log2FoldChange, y = -log10(pvalue), 
+                 label = unlist(tstrsplit(gene_id,split="\\|",keep = 2))),
+             size=3, colour = "dodgerblue", segment.linetype = "dotted",
+             nudge_x = -1, 
+             force = 3,
+             force_pull = NA,
+             vjust=0,
+             direction = "y",
+             segment.size = 0.2) +
+  
+  # add scales and extras
+  scale_x_continuous(limits = c(-7,7), breaks = seq(-10,10,2)) +
+  ggtitle(paste0("Volcano showing results of DGE analysis comparing d28 versus d0\n",
+                 "red/blue indicate genes significantly changed in this comparison\n",
+                 "many inflamatory markers decrease by 28 days")) +
+  xlab("Log2 Fold Change (day28/day0)") +
+  theme(aspect.ratio = 0.75,
+        panel.grid.major.y = element_blank(),
+        axis.text = element_text(colour = "black"))
+
+```
+
+## 4. Gene Set Enrichemnt Analysis (GSEA)
+
+  - After identification of diferentially changing genes, it is very informative to determine whether these changes amount to any systemic / pathway-specific changes
+  - It is much easier to interpret results of DGE in terms of pathway incread of single gene - such analysis has more significance
+  - To do this we extract significantly changing genes from DESeq results
+    - When there are too few _padj_ significant genes it is possible to do GSEA with genes that pass _pvalue_ significance
+    - If there are not signifcant genes even by pvalue, analysis really looses significance
+
+
+##
+```{r GSEA analysis}
+## input data
+#res.sex.dt
+
+## First order the results by the log2FolChange from increasing to decreasing
+## NOTE: write into new object to not overwrite the original results
+res.sex.gsea.dt <- res.sex.dt[order(-log2FoldChange)]
+res.sex.gsea.dt
+
+## Make sure gene_name is available, if not extract it to new column
+res.sex.gsea.dt[,"gene_name" := tstrsplit(gene_id,split="\\|",keep = 2)]
+res.sex.gsea.dt
+
+## check if gene name is unique - duplicates cannot move further in analysis
+summary(duplicated(res.sex.gsea.dt[["gene_name"]])) # <- there are 49 duplicates here
+
+## what do duplicates look like?
+dup_gnames <- unique(res.sex.gsea.dt[duplicated(res.sex.gsea.dt[["gene_name"]])][["gene_name"]])
+length(dup_gnames)
+res.sex.gsea.dt[gene_name %in% dup_gnames][order(gene_name)][1:6]
+
+##
+## Select the genes to use for GSEA
+##
+
+## Sets cutoff of significance
+res_cutoff <- 0.05
+
+## Check:Since there are more than few hundred sig. genes by padj use those
+nrow(res.sex.gsea.dt[padj<res_cutoff])
+
+## Check: Are any of 2860 duplicated? <- YES some are
+res.sex.gsea.dt[padj<res_cutoff][duplicated(res.sex.gsea.dt[padj<res_cutoff][["gene_name"]])]
+res.sex.gsea.dt[padj<res_cutoff][gene_name %in% "P2RY8"]
+
+## Remove genes with _PAR_Y
+res.sex.gsea.dt <- res.sex.gsea.dt[grep("_PAR_Y",gene_id, invert = TRUE)]
+
+## Check: How do our duplicates look now?.... there are fewer
+res.sex.gsea.dt[padj<res_cutoff][duplicated(res.sex.gsea.dt[padj<res_cutoff][["gene_name"]])]
+
+## Keep only unique gene names
+res.sex.gsea.dt <- res.sex.gsea.dt[!duplicated(gene_name)]
+
+## Extract log2FoldChange for these genes into a vector
+geneVec <- res.sex.gsea.dt[padj <= res_cutoff][["log2FoldChange"]]
+
+## Add names for each gene to the vector
+names(geneVec) <- res.sex.gsea.dt[padj <= res_cutoff][["gene_name"]]
+
+## Check if vector names are duplicated
+summary(duplicated(names(geneVec))) ## NO MORE duplications 
+
+##
+## DO THIS IF YOU DID NOT FILTER BEFORE
+
+## If above is yes: Find the duplicates and their names
+#geneVec[duplicated(names(geneVec))]
+#dup_names <- names(geneVec[duplicated(names(geneVec))])
+#geneVec[names(geneVec) %in% dup_names]
+
+## For now remove duplicates BUT - work to avoid having duplicate gene names
+#geneVec <- geneVec[!duplicated(names(geneVec))]
+
+##
+##
+
+## gene vector to proceed with GSEA analysis
+geneVec[1:10]
+
+##
+## Use the msigdbr package to load gene lists to compare with
+##
+
+#?msigdbr
+#msigdbr(species = "Homo sapiens", category = "C7") # <- other gene sets
+msig.H.dt <- as.data.table(msigdbr(species = "Homo sapiens", category = "H"))
+msig.H.dt[1:5,]
+
+## View how many genes are involved in each category
+msig.H.dt[,.N,by = gs_name]
+
+## Extract only gene_name and pathway name columns
+msig.H.t2g <- msig.H.dt[,.SD,.SDcols = c("gs_name","gene_symbol")]
+msig.H.t2g
+
+##
+## Run GSEA
+## => Much of the options can found online in the ClusterProfiler manual
+##
+
+?GSEA
+agsea <- clusterProfiler::GSEA(geneList = geneVec, 
+                               TERM2GENE = msig.H.t2g,
+                               minGSSize = 5, # minimum number of genes to match pathway
+                               eps = 0, 
+                               pvalueCutoff = 1, # this way all pathways are returned
+                               pAdjustMethod = "BH", # many other methods are out there
+                               by = 'fgsea',
+                               seed = TRUE)
+
+agsea.dt <- as.data.table(x = agsea)
+
+## Clean up and organize the results table
+agsea.dt <- agsea.dt[order(p.adjust)]
+agsea.dt[,"sig" := p.adjust<=0.05]
+agsea.dt[,"updown" := ifelse(NES<0,"down","up")]
+agsea.dt[["ID"]] <- gsub("HALLMARK_","",agsea.dt[["ID"]])
+agsea.dt[["ID"]] <- tolower(gsub("_"," ",agsea.dt[["ID"]]))
+agsea.dt[["ID"]] <- factor(agsea.dt[["ID"]], levels = agsea.dt[["ID"]])
+agsea.dt[["Description"]] <- NULL
+agsea.dt[1:4]
+
+## FINAL RESULT
+agsea.dt[1:4]
+
+```
+
+##
+## PART 3
+##
+
+
+Goal: 
+  - Explore ways of plotting results from GSEA and DESeq
+  - Other ways of visualizing data
+
+
+## 1. Barplot of up and down-regulated pathways
+  - This plot highlights the pathways that have increased or decreased based on the significance cut-offs
+  - It is sometimes helpful to plot the pathways that are not part of the significance
+
+```{r, BARPLOT - GSEA results - BARPLOT, fig.align='left', fig.width=7, fig.height=9}
+## Input data
+agsea.dt
+
+## Reorder to have NES reveresed
+agsea.dt <- agsea.dt[order(-NES)]
+
+## Change order of labels by adjusting the factor levels
+class(agsea.dt[["ID"]])
+agsea.dt[["ID"]] <- factor(agsea.dt[["ID"]], levels = agsea.dt[["ID"]])
+
+## Plot - subset
+ggp.d28.gset.bar <- ggplot() + theme_pubclean() +
+  geom_bar(data = agsea.dt[pvalue <= 0.05], 
+           aes(x = NES, y = ID, fill = updown),
+           stat = "identity") +
+   geom_bar(data = agsea.dt[p.adjust <= 0.05], ## SHOW SIGNIFICANT
+            aes(x = NES, y = ID), 
+            colour = "black",lwd = 2,
+            fill=NA,
+           stat = "identity") +
+  scale_fill_manual(values = c("#427AA1","#CE8D99")) +
+  ggtitle("Black box: padj <= 0.05") +
+  theme(aspect.ratio =1,
+        legend.position = "bottom",
+        axis.text.y = element_text()); ggp.d28.gset.bar
+
+## Plot - all
+ggp.d28.gset.bar <- ggplot() + theme_pubclean() +
+  geom_bar(data = agsea.dt, ## ALL PATHWAYS
+           aes(x = NES, y = ID, fill = updown),
+           stat = "identity") +
+   geom_bar(data = agsea.dt[p.adjust <= 0.05], ## SHOW SIGNIFICANT
+            aes(x = NES, y = ID), 
+            colour = "black", lwd = 0.51,
+            fill=NA,
+           stat = "identity") +
+  scale_fill_manual(values = c("#427AA1","#CE8D99")) +
+  ggtitle("Black box: padj <= 0.05") +
+
+  theme(aspect.ratio = 2,
+        legend.position = "bottom",
+        axis.text.y = element_text()); ggp.d28.gset.bar
+
+```
+
+## 2. Leading edge plots - ClusterProfiler
+
+  - These plots are helpful to demonstrate the distribution of the genes within the differential spectrum
+  - Secondly, it indirectly shows where are the genes responsible for the pathway direction located and how they contribute to enrichment
+  - Take your time to explore different plots in the book online and playig witht them to make them look clear in R (most of the are ggplot objects)
+    - See the book: https://yulab-smu.top/biomedical-knowledge-mining-book/enrichplot.html
+    
+##
+```{r LEADING edge plots, fig.align='left', fig.width=7, fig.height=9}
+## Input data
+#agsea
+
+##
+## Below plots are all parth of the ClusterProfiler package
+##
+
+
+## Dotplot 
+dotplot(object = agsea)
+
+## Network plot
+cnetplot(x = agsea, foldChange=geneVec, base.size =3 )
+
+##
+## heatplot
+## -> lets play with this one a little
+##
+
+## basic
+heatplot(x = agsea, showCategory =4, foldChange = geneVec) 
+
+
+## Modified - This is a ggplot object
+heatplot(x = agsea, showCategory =4, foldChange = geneVec) + 
+  theme_pubclean() +
+  scale_fill_gradient2(low = "dodgerblue4", mid = "white",high = "firebrick3") +
+
+  coord_flip() +
+  theme(aspect.ratio = 5,legend.position = "right",
+        axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1, size = 8, ),
+        axis.text = element_text(colour = "black"))
+
+
+## Plot using pre-built function
+?gseaplot2
+
+## Leading edge - simple
+gseaplot(x = agsea, geneSetID = "HALLMARK_INTERFERON_ALPHA_RESPONSE")
+
+## Leading edge - more comlicated
+gseaplot2(x = agsea, geneSetID = "HALLMARK_INTERFERON_ALPHA_RESPONSE")
+
+## Leading edge - multiple gene sets
+gseaplot2(x = agsea, geneSetID = 1:3)
+
+
+```
+
+
+## NEXT
+
+  - Clustering heat maps
+  - Plotting your own heatmaps
+  - Basic Statistics
+  - Table1 of metadata
+
+
