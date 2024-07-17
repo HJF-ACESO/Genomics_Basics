@@ -1232,10 +1232,10 @@ table1(x = strata,
 ##
 
 ## this will not work because only 2 levels are permited for stat comparisons
-table1(~sampling_location + mortality + pathogen + age | time, 
-       data = meta.dt, 
-       overall = F, 
-       extra.col = list("P-value"=pvalue))
+#table1(~sampling_location + mortality + pathogen + age | time, 
+#       data = meta.dt, 
+#       overall = F, 
+#       extra.col = list("P-value"=pvalue))
 
 ## confirm that there are more than two levels in the time variable
 meta.dt[,.N,by=time]
